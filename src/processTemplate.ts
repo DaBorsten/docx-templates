@@ -22,6 +22,8 @@ import {
   Image,
   BUILT_IN_COMMANDS,
   ImageExtensions,
+  ImageShapes,
+  ImageShape,
   NonTextNode,
 } from './types';
 import {
@@ -35,6 +37,7 @@ import {
   UnterminatedForLoopError,
 } from './errors';
 import { logger } from './debug';
+import { getImageAspectRatio } from './imageSize';
 
 export function newContext(
   options: CreateReportOptions,
@@ -1013,6 +1016,96 @@ function validateImagePars(pars: ImagePars) {
     throw new Error(`invalid image height: ${pars.height} (in cm)`);
   validateImage(pars);
   if (pars.thumbnail) validateImage(pars.thumbnail);
+  if (pars.shape != null && !ImageShapes.includes(pars.shape))
+    throw new Error(
+      `invalid image shape: ${pars.shape} (must be a DrawingML preset geometry, e.g. 'roundRect' or 'ellipse')`
+    );
+  if (pars.border) {
+    const { color, width } = pars.border;
+    if (typeof color !== 'string' || !/^#?[0-9a-f]{6}$/i.test(color))
+      throw new Error(
+        `invalid image border color: ${color} (must be a hex RGB color, e.g. '#ff0000')`
+      );
+    if (!Number.isFinite(width) || width < 0)
+      throw new Error(`invalid image border width: ${width} (in pt)`);
+  }
+}
+
+// Name of the adjust value that holds the corner radius, per shape.
+const CORNER_RADIUS_ADJUSTMENTS: { [shape in ImageShape]?: string } = {
+  roundRect: 'adj',
+  round1Rect: 'adj',
+  round2SameRect: 'adj1',
+  round2DiagRect: 'adj1',
+  snipRoundRect: 'adj1',
+};
+
+// Returns the preset geometry of the image and its adjust values.
+// The corner radius is stored as a fraction (in 100,000ths) of the shorter side, capped at 50%.
+function getImageGeometry(pars: ImagePars): {
+  prst: ImageShape;
+  adjustments: { [name: string]: number };
+} {
+  const { cornerRadius, shapeAdjustments = {} } = pars;
+  for (const [name, val] of Object.entries(shapeAdjustments)) {
+    if (!Number.isFinite(val))
+      throw new Error(`invalid image shape adjustment ${name}: ${val}`);
+  }
+  if (cornerRadius == null) {
+    return { prst: pars.shape ?? 'rect', adjustments: shapeAdjustments };
+  }
+
+  const prst = pars.shape ?? 'roundRect';
+  const adjName = CORNER_RADIUS_ADJUSTMENTS[prst];
+  if (!adjName)
+    throw new Error(
+      `image cornerRadius is not supported for shape ${prst} (use one of ${Object.keys(
+        CORNER_RADIUS_ADJUSTMENTS
+      )} or shapeAdjustments)`
+    );
+  const percentage =
+    typeof cornerRadius === 'string'
+      ? /^\s*(\d+(?:\.\d+)?)\s*%\s*$/.exec(cornerRadius)
+      : null;
+  const fraction = percentage
+    ? Number(percentage[1]) / 100
+    : typeof cornerRadius === 'number'
+    ? cornerRadius / Math.min(pars.width, pars.height)
+    : NaN;
+  if (!Number.isFinite(fraction) || fraction < 0)
+    throw new Error(
+      `invalid image cornerRadius: ${cornerRadius} (must be a number in cm or a percentage like '10%')`
+    );
+  const adj = Math.round(Math.min(fraction, 0.5) * 100e3);
+  return { prst, adjustments: { [adjName]: adj, ...shapeAdjustments } };
+}
+
+// Returns the attributes of a:srcRect: the part of the source image mapped onto the frame,
+// as insets in 1,000ths of a percent. Positive insets crop the image ('fill'),
+// negative ones leave empty space around it ('fit').
+function getImageSrcRect(pars: ImagePars): { [name: string]: string } {
+  const { crop } = pars;
+  if (crop == null) return {};
+  if (crop !== 'fill' && crop !== 'fit')
+    throw new Error(`invalid image crop: ${crop} (must be 'fill' or 'fit')`);
+  const imageRatio = pars.aspectRatio ?? getImageAspectRatio(pars);
+  if (imageRatio == null || !Number.isFinite(imageRatio) || imageRatio <= 0)
+    throw new Error(
+      pars.aspectRatio == null
+        ? 'could not read the size of the image, provide its aspectRatio (width / height) to use crop'
+        : `invalid image aspectRatio: ${pars.aspectRatio}`
+    );
+  const frameRatio = pars.width / pars.height;
+  // One of these is positive and the other negative, unless the ratios match.
+  const horizontal = (1 - frameRatio / imageRatio) / 2;
+  const vertical = (1 - imageRatio / frameRatio) / 2;
+  const pick = crop === 'fill' ? Math.max : Math.min;
+  const x = Math.round(pick(horizontal, 0) * 100e3);
+  const y = Math.round(pick(vertical, 0) * 100e3);
+  const srcRect: { [name: string]: string } = {};
+  if (x) Object.assign(srcRect, { l: String(x), r: String(x) });
+  if (y) Object.assign(srcRect, { t: String(y), b: String(y) });
+  return srcRect;
 }
 
 const processImage = (ctx: Context, imagePars: ImagePars) => {
@@ -1040,6 +1133,27 @@ const processImage = (ctx: Context, imagePars: ImagePars) => {
   const rot = imagePars.rotation
     ? (imagePars.rotation * 60e3).toString()
     : undefined;
+
+  const { prst, adjustments } = getImageGeometry(imagePars);
+  const avNodes = Object.entries(adjustments).map(([name, val]) =>
+    node('a:gd', { name, fmla: `val ${Math.round(val)}` })
+  );
+
+  // Line widths are in EMUs (12,700 per point).
+  const { border } = imagePars;
+  const borderWidth = border ? Math.round(border.width * 12700) : 0;
+  const lnNode =
+    border && borderWidth > 0
+      ? node('a:ln', { w: String(borderWidth) }, [
+          node('a:solidFill', {}, [
+            node('a:srgbClr', {
+              val: border.color.replace('#', '').toUpperCase(),
+            }),
+          ]),
+        ])
+      : node('a:ln', {}, [node('a:noFill')]);
+  // The border is centered on the outline, so half of it extends beyond the image.
+  const effectExtent = String(Math.ceil(borderWidth / 2));
 
   if (ctx.images[imgRelId].extension === '.svg') {
     // Default to an empty thumbnail, as it is not critical and just part of the docx standard's scaffolding.
@@ -1078,7 +1192,7 @@ const processImage = (ctx: Context, imagePars: ImagePars) => {
         node('a:blip', { 'r:embed': imgRelId, cstate: 'print' }, [
           node('a:extLst', {}, extNodes),
         ]),
-        node('a:srcRect'),
+        node('a:srcRect', getImageSrcRect(imagePars)),
         node('a:stretch', {}, [node('a:fillRect')]),
       ]),
       node('pic:spPr', { bwMode: 'auto' }, [
@@ -1086,15 +1200,25 @@ const processImage = (ctx: Context, imagePars: ImagePars) => {
           node('a:off', { x: '0', y: '0' }),
           node('a:ext', { cx, cy }),
         ]),
-        node('a:prstGeom', { prst: 'rect' }, [node('a:avLst')]),
+        node('a:prstGeom', { prst }, [node('a:avLst', {}, avNodes)]),
         node('a:noFill'),
-        node('a:ln', {}, [node('a:noFill')]),
+        lnNode,
       ]),
     ]
   );
   const drawing = node('w:drawing', {}, [
     node('wp:inline', { distT: '0', distB: '0', distL: '0', distR: '0' }, [
       node('wp:extent', { cx, cy }),
+      ...(borderWidth > 0
+        ? [
+            node('wp:effectExtent', {
+              l: effectExtent,
+              t: effectExtent,
+              r: effectExtent,
+              b: effectExtent,
+            }),
+          ]
+        : []),
       node('wp:docPr', { id, name: `Picture ${id}`, descr: alt }),
       node('wp:cNvGraphicFramePr', {}, [
         node('a:graphicFrameLocks', {

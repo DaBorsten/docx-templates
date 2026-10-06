@@ -423,6 +423,17 @@ The JS snippet must return an _image object_ or a Promise of an _image object_, 
 * `alt` _[optional]_: optional alt text.
 * `rotation` _[optional]_: optional rotation in degrees, with positive angles moving clockwise.
 * `caption` _[optional]_: optional caption displayed below the image
+* `shape` _[optional]_: shape the image is cropped to, like Word's "Crop to Shape". Any DrawingML preset geometry name, e.g. `'roundRect'`, `'ellipse'`, `'heart'`, `'star5'`, `'cloud'`, `'flowChartDocument'` (see `ImageShapes` in [types.ts](src/types.ts) for the full list). Defaults to `'rect'`.
+* `cornerRadius` _[optional]_: corner radius, either a number _in cm_ or a percentage string such as `'10%'`, relative to the shorter side of the image (`'50%'` is the maximum). Implies `shape: 'roundRect'` when no shape is given; also works with `'round1Rect'`, `'round2SameRect'`, `'round2DiagRect'` and `'snipRoundRect'`.
+* `shapeAdjustments` _[optional]_: raw adjust values of the shape (the yellow handles in Word), keyed by guide name, e.g. `{ adj: 25000 }`. Names and ranges depend on the shape.
+* `border` _[optional]_: border along the outline of the shape, as `{ color, width }` with a hex RGB `color` (e.g. `'#ff0000'`) and a `width` _in pt_.
+* `crop` _[optional]_: how the image is placed in the `width` x `height` frame when their aspect ratios differ, like Word's Crop menu. `'fill'` scales the image to cover the whole frame and crops what overflows, `'fit'` scales it to fit inside the frame and leaves the rest empty. Both keep the aspect ratio and center the image. By default the image is stretched to the frame.
+* `aspectRatio` _[optional]_: width / height ratio of the source image, used by `crop`. It is read from the image data, so it is only needed when that fails (e.g. an SVG without `width`/`height` or `viewBox`) or to override it.
+
+For example, an image with rounded corners and a 2pt border:
+```js
+return { width: 6, height: 4, data, extension: '.png', cornerRadius: '10%', border: { color: '#1f4e79', width: 2 } };
+```
 
 In the .docx template:
 ```
